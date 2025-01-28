@@ -38,7 +38,6 @@ sympy==1.13.2
 torch==2.4.0
 torchviz==0.0.2
 triton==3.0.0
--e git+ssh://git@github.com/and-rewsmith/ttt-sequence-model.git@02ab47a7ff4e1a070612d1a255368cc6afb393d4#egg=ttt
 typing_extensions==4.12.2
 urllib3==2.2.2
 wandb==0.17.7

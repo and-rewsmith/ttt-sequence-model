@@ -16,16 +16,17 @@ VOCAB_SIZE = 15
 SEQUENCE_LEN = 40
 
 # training
-EPOCHS = 10
+EPOCHS = 300
 BATCH_SIZE = 50
 
 TTT_BASE_INNER_LEARNING_RATE = 1e-4
-TTT_INNER_LEARNING_RATE_LEARNING_RATE = 1e-1
-TTT_OUTER_LEARNING_RATE = 1e-3
-EMBEDDING_DIM = 22
-LOW_PASS_FILTER_DIM = 10
+TTT_INNER_LEARNING_RATE_LEARNING_RATE = 1e-4
+TTT_OUTER_LEARNING_RATE = 1e-2
+EMBEDDING_DIM = 32
+LOW_PASS_FILTER_DIM = 16
 MINIBATCH_SIZE = 5
 DROPOUT = 0.0
+LAYERS = 3
 
 
 class PositionalEncoding(nn.Module):
@@ -64,7 +65,10 @@ class SequentialNumbers(Dataset):
         sequence = torch.zeros(self.sequence_len, VOCAB_SIZE)
 
         for i in range(self.sequence_len):
-            hot_index = (idx + i) % VOCAB_SIZE
+            if i % VOCAB_SIZE < 6:
+                hot_index = (idx + i**2) % VOCAB_SIZE
+            else:
+                hot_index = (idx + i) % VOCAB_SIZE
             sequence[i, hot_index] = 1.0
 
         return sequence
@@ -91,6 +95,7 @@ class TTTInner(nn.Module):
     def online_inference(self: Self, src: torch.Tensor) -> torch.Tensor:
         _sequences, _batches, _features = src.shape
         src = torch.split(src, self.mini_batch_size)  # type: ignore[assignment]
+        assert src[0].shape == (self.mini_batch_size, BATCH_SIZE, EMBEDDING_DIM)
 
         outputs = []
         total_loss = 0
@@ -120,20 +125,25 @@ class TTTInner(nn.Module):
 
             # calculate the learned inner learning rate for each parameter and shape appropriately
             inner_learning_rate = self.get_inner_learning_rate(minibatch)
-            inner_learning_rate = inner_learning_rate.reshape(-1, self.filter_dim ** 2)
-            inner_learning_rate = inner_learning_rate.mean(dim=0)
-            inner_learning_rate = inner_learning_rate.reshape(self.filter_dim, self.filter_dim)
-            inner_learning_rate_bias = inner_learning_rate.mean(dim=1)
+            # inner_learning_rate = inner_learning_rate.reshape(-1, self.filter_dim ** 2)
+            # inner_learning_rate = inner_learning_rate.mean(dim=0)
+            # inner_learning_rate = inner_learning_rate.reshape(self.filter_dim, self.filter_dim)
+            # inner_learning_rate_bias = inner_learning_rate.mean(dim=1)
 
             # TODO: consider adding layer norm here to stabilize batch effects of averaging
 
-            wandb.log({"inner_learning_rate": inner_learning_rate.norm()})
-            wandb.log({"inner_learning_rate_bias": inner_learning_rate_bias.norm()})
-            wandb.log(
-                {"inner_learning_rate_specific_index": inner_learning_rate[0][0]})
+            # wandb.log({"inner_learning_rate": inner_learning_rate.norm()})
+            # wandb.log({"inner_learning_rate_bias": inner_learning_rate_bias.norm()})
+            # wandb.log(
+            #     {"inner_learning_rate_specific_index": inner_learning_rate[0][0]}) print(self.w.weight.shape)
+
+            # print(self.w.weight.shape)
+            # print(inner_learning_rate.shape)
+            # print(gradients[0].shape)
+            # input()
 
             updated_weight = self.w.weight - inner_learning_rate * gradients[0]
-            updated_bias = self.w.bias - inner_learning_rate_bias * gradients[1]
+            updated_bias = self.w.bias - inner_learning_rate * gradients[1]
 
             # calculate output using updated `w_bar`
             z = torch.nn.functional.linear(test_view, updated_weight, updated_bias) + test_view
@@ -167,7 +177,8 @@ class TTTHead(nn.Module):
         self.theta_v = nn.Parameter(torch.randn(input_dim, filter_dim))
         self.theta_q = nn.Parameter(torch.randn(input_dim, filter_dim))
         self.theta_o = nn.Parameter(torch.randn(filter_dim, input_dim))
-        self.inner_learning_rate_params = nn.Linear(input_dim, filter_dim ** 2)
+        # self.inner_learning_rate_params = nn.Linear(input_dim, filter_dim ** 2)
+        self.get_inner_learning_rate_params = nn.Parameter(torch.Tensor([TTT_BASE_INNER_LEARNING_RATE]))
 
         self.inner = TTTInner(mini_batch_size, filter_dim=filter_dim,
                               get_theta_k=self.get_theta_k,
@@ -178,7 +189,7 @@ class TTTHead(nn.Module):
         torch.nn.init.kaiming_uniform_(self.theta_v)
         torch.nn.init.kaiming_uniform_(self.theta_q)
         torch.nn.init.kaiming_uniform_(self.theta_o)
-        torch.nn.init.kaiming_uniform_(self.inner_learning_rate_params.weight)
+        # torch.nn.init.kaiming_uniform_(self.inner_learning_rate_params.weight)
 
         self.mini_batch_size = mini_batch_size
         self.input_dim = input_dim
@@ -204,11 +215,12 @@ class TTTHead(nn.Module):
         return self.theta_v
 
     def get_inner_learning_rate(self: Self, input: torch.Tensor) -> Tensor:
-        pre_sigmoid = self.inner_learning_rate_params(input)
-        wandb.log({"pre_sigmoid": pre_sigmoid.mean()})
-        post_sigmoid = self.ttt_base_inner_learning_rate * F.sigmoid(pre_sigmoid)
-        wandb.log({"post_sigmoid": post_sigmoid.mean()})
-        return post_sigmoid
+        # pre_sigmoid = self.inner_learning_rate_params(input)
+        # wandb.log({"pre_sigmoid": pre_sigmoid.mean()})
+        # post_sigmoid = self.ttt_base_inner_learning_rate * F.sigmoid(pre_sigmoid)
+        # wandb.log({"post_sigmoid": post_sigmoid.mean()})
+        # return post_sigmoid
+        return self.get_inner_learning_rate_params
 
 
 class TTTBlock(nn.Module):
@@ -223,10 +235,13 @@ class TTTBlock(nn.Module):
         self.ttt_head = TTTHead(mini_batch_size=mini_batch_size, input_dim=embedding_dim,
                                 filter_dim=filter_dim,
                                 ttt_base_inner_learning_rate=ttt_base_inner_learning_rate)
+        self.layer_norm = nn.LayerNorm(embedding_dim)
 
     def train_block(self, input: torch.Tensor) -> torch.Tensor:
         sequences, batches, features = input.shape
-        outputs = self.ttt_head.train_head(input)
+        sub_outputs = self.ttt_head.train_head(input)
+        outputs = sub_outputs + input
+        outputs = self.layer_norm(outputs)
         return outputs
 
     def set_grad_fn(self, alter_grad_fn: Callable[[bool], None]) -> None:
@@ -265,12 +280,12 @@ class TTTModel(nn.Module):
 
         self.optim = SGD(params, lr=ttt_outer_learning_rate)
 
-        params = []
-        for block in self.ttt_blocks:
-            params.extend(block.ttt_head.inner_learning_rate_params.parameters())
-        self.optim_inner_lr = SGD(
-            params,
-            lr=ttt_inner_learning_rate_learning_rate)
+        # params = []
+        # for block in self.ttt_blocks:
+        #     params.extend(block.ttt_head.inner_learning_rate_params.parameters())
+        # self.optim_inner_lr = SGD(
+        #     params,
+        #     lr=ttt_inner_learning_rate_learning_rate)
 
         self.criterion = nn.CrossEntropyLoss()
 
@@ -284,6 +299,7 @@ class TTTModel(nn.Module):
         output = src
         for block in self.ttt_blocks:
             output = block.train_block(output)
+            # output = nn.LeakyReLU()(output)
 
         output: Tensor = self.lm_head(output)  # type: ignore
         assert output.shape == (SEQUENCE_LEN, BATCH_SIZE, self.vocab_size)
@@ -292,7 +308,7 @@ class TTTModel(nn.Module):
 
     def train_model(self: Self, src: torch.Tensor) -> torch.Tensor:
         self.optim.zero_grad()
-        self.optim_inner_lr.zero_grad()
+        # self.optim_inner_lr.zero_grad()
 
         assert src.shape == (SEQUENCE_LEN, BATCH_SIZE)
         shifted_labels = src[1:, :]
@@ -329,15 +345,15 @@ class TTTModel(nn.Module):
             assert block.ttt_head.theta_q.grad is None
             assert block.ttt_head.theta_v.grad is None
             assert block.ttt_head.theta_o.grad is None
-            assert block.ttt_head.inner_learning_rate_params.weight.grad is None
+            # assert block.ttt_head.inner_learning_rate_params.weight.grad is None
         assert self.lm_head.weight.grad is None
 
         loss.backward()
 
         wandb.log({"w_norm": self.ttt_blocks[0].ttt_head.inner.w.weight.norm()})
-        wandb.log(
-            {"inner_lr_params_grad": self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight.grad.norm()})
-        wandb.log({"inner_lr_params": self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight.norm()})
+        # wandb.log(
+        #     {"inner_lr_params_grad": self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight.grad.norm()})
+        # wandb.log({"inner_lr_params": self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight.norm()})
 
         # NOTE: Uncomment if you want to visualize the computation graph. You
         # will need to get creative for the inner graph as it doesn't use
@@ -353,13 +369,13 @@ class TTTModel(nn.Module):
             assert block.ttt_head.theta_q.grad is not None
             assert block.ttt_head.theta_v.grad is not None
             assert block.ttt_head.theta_o.grad is not None
-            assert block.ttt_head.inner_learning_rate_params.weight.grad is not None
+            # assert block.ttt_head.inner_learning_rate_params.weight.grad is not None
         assert self.lm_head.weight.grad is not None
         self.optim.step()
-        self.optim_inner_lr.step()
-        wandb.log(
-            {"inner_learning_rate_params_specific_weight":
-                self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight[0][0]})
+        # self.optim_inner_lr.step()
+        # wandb.log(
+        #     {"inner_learning_rate_params_specific_weight":
+        #         self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight[0][0]})
 
         return loss.item()
 
@@ -377,9 +393,10 @@ if __name__ == "__main__":
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    print(f"Using device: {device}")
 
     model = TTTModel(
-        num_layers=3, mini_batch_size=MINIBATCH_SIZE, embedding_dim=EMBEDDING_DIM, filter_dim=LOW_PASS_FILTER_DIM,
+        num_layers=LAYERS, mini_batch_size=MINIBATCH_SIZE, embedding_dim=EMBEDDING_DIM, filter_dim=LOW_PASS_FILTER_DIM,
         ttt_outer_learning_rate=TTT_OUTER_LEARNING_RATE, ttt_base_inner_learning_rate=TTT_BASE_INNER_LEARNING_RATE,
         ttt_inner_learning_rate_learning_rate=TTT_INNER_LEARNING_RATE_LEARNING_RATE, vocab_size=VOCAB_SIZE,
         dropout=DROPOUT)
