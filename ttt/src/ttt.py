@@ -84,8 +84,9 @@ class TTTInner(nn.Module):
 
         self.mini_batch_size = mini_batch_size
         self.filter_dim = filter_dim
-        self.w = nn.Linear(filter_dim, filter_dim)
-        torch.nn.init.kaiming_uniform_(self.w.weight)
+        self.w = nn.Sequential(nn.Linear(filter_dim, filter_dim), nn.LeakyReLU(), nn.Linear(filter_dim, filter_dim))
+        torch.nn.init.kaiming_uniform_(self.w[0].weight)
+        torch.nn.init.kaiming_uniform_(self.w[2].weight)
 
         self.get_theta_k = get_theta_k
         self.get_theta_q = get_theta_q
@@ -118,7 +119,7 @@ class TTTInner(nn.Module):
 
             # compute gradients for `w` and manually update
             gradients = grad(loss, list(self.w.parameters()), create_graph=True)
-            assert gradients[0].shape == self.w.weight.shape
+            assert gradients[0].shape == self.w[0].weight.shape
 
             wandb.log({"w_grad": gradients[0].norm()})
             wandb.log({"w_bias_grad": gradients[1].norm()})
@@ -142,23 +143,61 @@ class TTTInner(nn.Module):
             # print(gradients[0].shape)
             # input()
 
-            updated_weight = self.w.weight - inner_learning_rate * gradients[0]
-            updated_bias = self.w.bias - inner_learning_rate * gradients[1]
+            layers_for_model = []
+            for layer in self.w:
+                # append if not leaky relu
+                if not isinstance(layer, nn.LeakyReLU):
+                    layers_for_model.append(layer)
 
-            # calculate output using updated `w_bar`
-            z = torch.nn.functional.linear(test_view, updated_weight, updated_bias) + test_view
+            updated_weights = []
+            updated_biases = []
+            for i, layer in enumerate(layers_for_model):
+                updated_weights.append(layer.weight - inner_learning_rate * gradients[i*2])
+                updated_biases.append(layer.bias - inner_learning_rate * gradients[i*2+1])
+
+            # instead of doing this via the forward method we need to do it via nn.functional
+            # but now we have a series of layers that we need to apply the linear layers to
+            # so we need to do this via a for loop
+            z = test_view
+            for i, (weight, bias) in enumerate(zip(updated_weights, updated_biases)):
+                z = F.linear(z, weight, bias)
+                if i < len(updated_weights) - 1:
+                    z = F.leaky_relu(z)
+            z = z + test_view
             outputs.append(z)
 
             # this was intended to stop grads from flowing back to weights (minor optimization)
             # doesn't seem to work though
             # leaving it
-            self.w.weight.requires_grad_(False)
-            self.w.bias.requires_grad_(False)
-
+            # for layer in self.w:
+            #     if isinstance(layer, nn.LeakyReLU):
+            #         continue
+            #     layer.weight.requires_grad_(False)
+            #     layer.bias.requires_grad_(False)
+                
             # update `w` with `w_bar` which resets computation graph
             with torch.no_grad():
-                self.w.weight = nn.Parameter(updated_weight, requires_grad=True)
-                self.w.bias = nn.Parameter(updated_bias, requires_grad=True)
+                # form a new sequential with updated weights that we just created
+                # this resets comp graph
+                new_layers = []
+                for weights, bias in zip(updated_weights, updated_biases):
+                    new_layers.append(nn.Linear(self.filter_dim, self.filter_dim))
+                    new_layers[-1].weight = nn.Parameter(weights, requires_grad=True)
+                    new_layers[-1].bias = nn.Parameter(bias, requires_grad=True)
+                    new_layers[-1].requires_grad_(True)
+                    new_layers.append(nn.LeakyReLU())
+                updated_w = nn.Sequential(*new_layers[:-1]) # remove last leaky relu
+
+                self.w = updated_w
+                # self.w.zero_grad() # this should just be no-op
+                # # assert each has requires grad enabled
+                # for layer in self.w:
+                #     if isinstance(layer, nn.LeakyReLU):
+                #         continue
+                #     assert layer.weight.requires_grad
+                #     assert layer.bias.requires_grad
+                #     assert layer.weight.grad is None
+                #     assert layer.bias.grad is None
 
         average_loss = total_loss / len(src)
         wandb.log({"inner_loss": average_loss})
@@ -340,7 +379,7 @@ class TTTModel(nn.Module):
 
         assert list(self.encoder.parameters())[0].grad is None
         for block in self.ttt_blocks:
-            assert block.ttt_head.inner.w.weight.grad is None
+            assert block.ttt_head.inner.w[0].weight.grad is None
             assert block.ttt_head.theta_k.grad is None
             assert block.ttt_head.theta_q.grad is None
             assert block.ttt_head.theta_v.grad is None
@@ -350,7 +389,7 @@ class TTTModel(nn.Module):
 
         loss.backward()
 
-        wandb.log({"w_norm": self.ttt_blocks[0].ttt_head.inner.w.weight.norm()})
+        wandb.log({"w_norm": self.ttt_blocks[0].ttt_head.inner.w[0].weight.norm()})
         # wandb.log(
         #     {"inner_lr_params_grad": self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight.grad.norm()})
         # wandb.log({"inner_lr_params": self.ttt_blocks[0].ttt_head.inner_learning_rate_params.weight.norm()})
@@ -364,10 +403,15 @@ class TTTModel(nn.Module):
 
         assert list(self.encoder.parameters())[0].grad is not None
         for block in self.ttt_blocks:
-            assert block.ttt_head.inner.w.weight.grad is None
+            # print("-----")
+            # print(block.ttt_head.inner.w[0])
+            # print(block.ttt_head.inner.w[0].weight.shape)
+            # print(block.ttt_head.inner.w[0].weight.grad[0][0])
+            assert block.ttt_head.inner.w[0].weight.grad is None
             assert block.ttt_head.theta_k.grad is not None
-            assert block.ttt_head.theta_q.grad is not None
+            assert block.ttt_head.theta_k.grad is not None
             assert block.ttt_head.theta_v.grad is not None
+            assert block.ttt_head.theta_q.grad is not None
             assert block.ttt_head.theta_o.grad is not None
             # assert block.ttt_head.inner_learning_rate_params.weight.grad is not None
         assert self.lm_head.weight.grad is not None
