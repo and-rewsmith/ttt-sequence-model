@@ -21,7 +21,7 @@ BATCH_SIZE = 50
 
 TTT_BASE_INNER_LEARNING_RATE = 1e-4
 TTT_INNER_LEARNING_RATE_LEARNING_RATE = 1e-4
-TTT_OUTER_LEARNING_RATE = 1e-2
+TTT_OUTER_LEARNING_RATE = 1e-1
 EMBEDDING_DIM = 32
 LOW_PASS_FILTER_DIM = 16
 MINIBATCH_SIZE = 5
@@ -166,6 +166,36 @@ class TTTInner(nn.Module):
         return torch.concat(outputs, dim=0)
 
 
+class SingleHeadAttention(nn.Module):
+    def __init__(self, embed_dim: int, dropout: float = 0.1):
+        super(SingleHeadAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.dropout = nn.Dropout(dropout)
+        self.scale = math.sqrt(embed_dim)
+
+        self.q_linear = nn.Linear(embed_dim, embed_dim)
+        self.k_linear = nn.Linear(embed_dim, embed_dim)
+        self.v_linear = nn.Linear(embed_dim, embed_dim)
+
+        self.out_linear = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor = None) -> Tensor:
+        Q = self.q_linear(query)  # [batch_size, seq_length, embed_dim]
+        K = self.k_linear(key)
+        V = self.v_linear(value)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [batch_size, seq_length, seq_length]
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, V)  # [batch_size, seq_length, embed_dim]
+        out = self.out_linear(out)
+        return out
+
+
 class TTTHead(nn.Module):
     def __init__(self: Self, mini_batch_size: int, input_dim: int, filter_dim: int,
                  ttt_base_inner_learning_rate: float) -> None:
@@ -177,7 +207,6 @@ class TTTHead(nn.Module):
         self.theta_v = nn.Parameter(torch.randn(input_dim, filter_dim))
         self.theta_q = nn.Parameter(torch.randn(input_dim, filter_dim))
         self.theta_o = nn.Parameter(torch.randn(filter_dim, input_dim))
-        # self.inner_learning_rate_params = nn.Linear(input_dim, filter_dim ** 2)
         self.get_inner_learning_rate_params = nn.Parameter(torch.Tensor([TTT_BASE_INNER_LEARNING_RATE]))
 
         self.inner = TTTInner(mini_batch_size, filter_dim=filter_dim,
@@ -195,13 +224,31 @@ class TTTHead(nn.Module):
         self.input_dim = input_dim
         self.low_pass_filter_dim = filter_dim
 
+        # Initialize Single-Head Attention
+        self.attention = SingleHeadAttention(embed_dim=filter_dim, dropout=DROPOUT)
+        self.layer_norm = nn.LayerNorm(filter_dim)
+        self.dropout = nn.Dropout(DROPOUT)
+
     def train_head(self: Self, input: torch.Tensor) -> torch.Tensor:
         sequences, batches, features = input.shape
 
+        # Original TTT computation
         outputs = self.inner.online_inference(input)
+        outputs = nn.LeakyReLU()(outputs)
         assert outputs.shape == (sequences, batches, self.low_pass_filter_dim)
 
-        outputs: Tensor = outputs @ self.theta_o  # type: ignore
+        # Prepare for Attention
+        attn_input = outputs.permute(1, 0, 2)  # [batches, sequences, filter_dim]
+        
+        # Apply Single-Head Attention
+        # attn_output = self.attention(attn_input, attn_input, attn_input)
+        # attn_output = self.dropout(attn_output)
+        # attn_output = self.layer_norm(attn_input + attn_output)  # Residual connection
+
+        # attn_output = attn_output.permute(1, 0, 2)  # [sequences, batches, filter_dim]
+
+        # outputs = attn_output @ self.theta_o  # type: ignore
+        outputs = outputs @ self.theta_o  # type: ignore
         assert outputs.shape == (sequences, batches, self.input_dim)
         return outputs
 
@@ -392,7 +439,7 @@ if __name__ == "__main__":
         }
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "mps")
     print(f"Using device: {device}")
 
     model = TTTModel(
